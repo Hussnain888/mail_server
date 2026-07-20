@@ -55,7 +55,7 @@ echo "Set a mailbox password for $USERNAME:"
 passwd "$USERNAME"
 
 # Create Maildir (Dovecot usually expects this under the home dir)
-mkdir -p "/home/$USERNAME/Maildir/{cur,new,tmp}"
+mkdir -p "/home/$USERNAME/Maildir/cur" "/home/$USERNAME/Maildir/new" "/home/$USERNAME/Maildir/tmp"
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/Maildir"
 
 # Log it into the CSV
