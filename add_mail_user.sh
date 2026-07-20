@@ -1,20 +1,26 @@
 #!/bin/bash
 #
-# add_mail_user.sh
-# Creates a Linux system user for mail (Postfix/Dovecot) and logs it
-# into users.csv so you have a running record of every account you create.
+# sync_users.sh
+# Keeps users.csv and the real system mail accounts fully in sync, in BOTH directions:
+#
+#   1. Any real Linux/mail account that exists but isn't in users.csv yet
+#      (e.g. created manually with useradd, or before this system existed)
+#      -> gets added to users.csv automatically.
+#
+#   2. Any new row you add to users.csv by hand (nano users.csv)
+#      -> gets a real account created for it (password generated, Maildir set up).
 #
 # Usage:
-#   sudo ./add_mail_user.sh <username> <full name> <domain>
+#   sudo ./sync_users.sh <domain>
 #
 # Example:
-#   sudo ./add_mail_user.sh john.doe "John Doe" myorg.com
+#   sudo ./sync_users.sh nastp.lab
 #
-# This will:
-#   1. Create the Linux user (john.doe)
-#   2. Prompt you to set a password for it (used for mail login too)
-#   3. Create their Maildir
-#   4. Record username, email, full name, and creation date in users.csv
+# To add a person going forward, you only ever need to:
+#   1. nano users.csv
+#   2. Add a line: username,Full Name,username@yourdomain.com,
+#      (leave the last field -- date_added -- blank)
+#   3. Save, exit, then run: sudo ./sync_users.sh nastp.lab
 
 set -e
 
@@ -23,46 +29,71 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-if [ $# -lt 3 ]; then
-  echo "Usage: sudo $0 <username> <full name> <domain>"
-  echo "Example: sudo $0 john.doe \"John Doe\" myorg.com"
+if [ $# -lt 1 ]; then
+  echo "Usage: sudo $0 <domain>"
+  echo "Example: sudo $0 nastp.lab"
   exit 1
 fi
 
-USERNAME="$1"
-FULLNAME="$2"
-DOMAIN="$3"
-EMAIL="${USERNAME}@${DOMAIN}"
-CSV_FILE="$(dirname "$0")/users.csv"
-DATE_ADDED="$(date '+%Y-%m-%d %H:%M:%S')"
+DOMAIN="$1"
+SCRIPT_DIR="$(dirname "$0")"
+USERS_CSV="$SCRIPT_DIR/users.csv"
+CREDS_CSV="$SCRIPT_DIR/credentials.csv"
 
-# Check if user already exists
-if id "$USERNAME" &>/dev/null; then
-  echo "Error: user '$USERNAME' already exists on this system."
-  exit 1
-fi
+[ -f "$USERS_CSV" ] || echo "username,full_name,email,date_added" > "$USERS_CSV"
+[ -f "$CREDS_CSV" ] || echo "username,email,password" > "$CREDS_CSV"
 
-# Create CSV with header if it doesn't exist yet
-if [ ! -f "$CSV_FILE" ]; then
-  echo "username,full_name,email,date_added" > "$CSV_FILE"
-fi
+echo "== Step 1: Backfilling existing system accounts into users.csv =="
 
-# Create the actual system/mail user
-useradd -m -c "$FULLNAME" -s /usr/sbin/nologin "$USERNAME"
+grep "/home" /etc/passwd | while IFS=: read -r USERNAME PASS UID GID FULLNAME HOMEDIR SHELL; do
 
-echo ""
-echo "Set a mailbox password for $USERNAME:"
-passwd "$USERNAME"
+  if grep -q "^${USERNAME}," "$USERS_CSV"; then
+    continue
+  fi
 
-# Create Maildir (Dovecot usually expects this under the home dir)
-mkdir -p "/home/$USERNAME/Maildir/cur" "/home/$USERNAME/Maildir/new" "/home/$USERNAME/Maildir/tmp"
-chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/Maildir"
+  EMAIL="${USERNAME}@${DOMAIN}"
+  DATE_ADDED="$(stat -c '%y' "$HOMEDIR" 2>/dev/null | cut -d'.' -f1)"
+  [ -z "$DATE_ADDED" ] && DATE_ADDED="unknown"
 
-# Log it into the CSV
-echo "${USERNAME},${FULLNAME},${EMAIL},${DATE_ADDED}" >> "$CSV_FILE"
+  echo "${USERNAME},${FULLNAME},${EMAIL},${DATE_ADDED}" >> "$USERS_CSV"
+  echo "➕ Backfilled existing account: $EMAIL"
+
+done
 
 echo ""
-echo "✅ Created mail account:"
-echo "   Email:    $EMAIL"
-echo "   Username: $USERNAME"
-echo "   Logged in: $CSV_FILE"
+echo "== Step 2: Creating real accounts for any new rows in users.csv =="
+
+TMP_FILE="$(mktemp)"
+head -n 1 "$USERS_CSV" > "$TMP_FILE"
+
+tail -n +2 "$USERS_CSV" | while IFS=',' read -r USERNAME FULLNAME EMAIL DATE_ADDED; do
+
+  [ -z "$USERNAME" ] && continue
+
+  if id "$USERNAME" &>/dev/null; then
+    echo "${USERNAME},${FULLNAME},${EMAIL},${DATE_ADDED}" >> "$TMP_FILE"
+    continue
+  fi
+
+  PASSWORD="$(openssl rand -base64 12)"
+  NOW="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  useradd -m -c "$FULLNAME" -s /usr/sbin/nologin "$USERNAME"
+  echo "${USERNAME}:${PASSWORD}" | chpasswd
+
+  mkdir -p "/home/$USERNAME/Maildir/cur" "/home/$USERNAME/Maildir/new" "/home/$USERNAME/Maildir/tmp"
+  chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/Maildir"
+
+  echo "${USERNAME},${EMAIL},${PASSWORD}" >> "$CREDS_CSV"
+  echo "✅ Created new account: $EMAIL"
+
+  echo "${USERNAME},${FULLNAME},${EMAIL},${NOW}" >> "$TMP_FILE"
+
+done
+
+mv "$TMP_FILE" "$USERS_CSV"
+
+echo ""
+echo "Sync complete."
+echo "  Full account list: $USERS_CSV"
+echo "  New passwords (if any): $CREDS_CSV"
